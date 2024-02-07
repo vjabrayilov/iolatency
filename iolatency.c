@@ -5,17 +5,12 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
-#define DISK_NAME_LEN 32
 #define MAX_SLOTS 27
-
-#define MINORBITS 20
-#define MINORMASK ((1U << MINORBITS) - 1)
-
-#define MKDEV(ma, mi) (((ma) << MINORBITS) | (mi))
 
 struct hist_key {
   __u32 cmd_flags;
@@ -29,13 +24,6 @@ struct hist {
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
 
 static volatile bool exiting;
-
-static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
-                           va_list args) {
-  if (level == LIBBPF_DEBUG && !env.verbose)
-    return 0;
-  return vfprintf(stderr, format, args);
-}
 
 static void sig_handler(int sig) { exiting = true; }
 
@@ -77,40 +65,12 @@ static int print_log2_hists(struct bpf_map *hists,
   return 0;
 }
 
-/*
- * BTF has a func proto for each tracepoint, let's check it like
- *   typedef void (*btf_trace_block_rq_issue)(void *, struct request *);
- *
- * Actually it's a typedef for a pointer to the func proto.
- */
-static bool has_block_rq_issue_single_arg(void) {
-  const struct btf *btf = btf__load_vmlinux_btf();
-  const struct btf_type *t1, *t2, *t3;
-  __u32 type_id;
-  bool ret = true; // assuming recent kernels
-
-  type_id =
-      btf__find_by_name_kind(btf, "btf_trace_block_rq_issue", BTF_KIND_TYPEDEF);
-  if ((__s32)type_id < 0)
-    return ret;
-
-  t1 = btf__type_by_id(btf, type_id);
-  if (t1 == NULL)
-    return ret;
-
-  t2 = btf__type_by_id(btf, t1->type);
-  if (t2 == NULL || !btf_is_ptr(t2))
-    return ret;
-
-  t3 = btf__type_by_id(btf, t2->type);
-  if (t3 && btf_is_func_proto(t3))
-    ret = (btf_vlen(t3) == 2); // ctx + arg
-
-  return ret;
-}
-
 int main(int argc, char **argv) {
-  struct biolatency_bpf *obj;
+  struct bpf_object *obj;
+  struct bpf_program *prog;
+  struct bpf_link *link;
+  int prog_fd;
+
   struct tm *tm;
   char ts[32];
   time_t t;
@@ -118,39 +78,67 @@ int main(int argc, char **argv) {
   int idx, cg_map_fd;
   int cgfd = -1;
 
-
-  libbpf_set_print(libbpf_print_fn);
-
-  obj = iolatency_bpf__open();
-  if (!obj) {
-    fprintf(stderr, "failed to open BPF object\n");
+  if (argc != 2) {
+    fprintf(stderr, "Usage: %s <seconds>\n", argv[0]);
     return 1;
   }
 
-  if (probe_tp_btf("block_rq_insert")) {
-    bpf_program__set_autoload(obj->progs.block_rq_insert, false);
-    bpf_program__set_autoload(obj->progs.block_rq_issue, false);
-    bpf_program__set_autoload(obj->progs.block_rq_complete, false);
-    if (!env.queued)
-      bpf_program__set_autoload(obj->progs.block_rq_insert_btf, false);
-  } else {
-    bpf_program__set_autoload(obj->progs.block_rq_insert_btf, false);
-    bpf_program__set_autoload(obj->progs.block_rq_issue_btf, false);
-    bpf_program__set_autoload(obj->progs.block_rq_complete_btf, false);
-    if (!env.queued)
-      bpf_program__set_autoload(obj->progs.block_rq_insert, false);
+  // Convert argument to integer
+  char *endptr;
+  long interval = strtol(argv[1], &endptr, 10);
+
+  // Check for conversion errors (no digits found, or not the entire string was
+  // consumed)
+  if (endptr == argv[1] || *endptr != '\0') {
+    fprintf(stderr, "Invalid input: %s is not an integer.\n", argv[1]);
+    return 1;
   }
 
-  err = iolatency_bpf__load(obj);
-  if (err) {
-    fprintf(stderr, "failed to load BPF object: %d\n", err);
-    goto cleanup;
+  // Check for negative values
+  if (interval < 0) {
+    fprintf(stderr, "Invalid input: time cannot be negative.\n");
+    return 1;
   }
 
-  err = iolatency_bpf__attach(obj);
-  if (err) {
-    fprintf(stderr, "failed to attach BPF object: %d\n", err);
-    goto cleanup;
+  // Load and verify BPF application
+  fprintf(stderr, "Loading BPF code in memory\n");
+  obj = bpf_object__open_file("iolatency.bpf.o", NULL);
+  if (libbpf_get_error(obj)) {
+    fprintf(stderr, "ERROR: opening BPF object file failed\n");
+    return 1;
+  }
+
+  // Attach BPF program
+  fprintf(stderr, "Attaching BPF program to tracepoint\n");
+  prog = bpf_object__find_program_by_name(obj, "syscount");
+  if (libbpf_get_error(prog)) {
+    fprintf(stderr, "ERROR: finding BPF program failed\n");
+    return 1;
+  }
+  prog_fd = bpf_program__fd(prog);
+  if (prog_fd < 0) {
+    fprintf(stderr, "ERROR: getting BPF program FD failed\n");
+    return 1;
+  }
+  // Load BPF program
+  fprintf(stderr, "Loading and verifying the code in the kernel\n");
+  if (bpf_object__load(obj)) {
+    fprintf(stderr, "ERROR: loading BPF object file failed\n");
+    return 1;
+  }
+
+  // Attach
+  const char *tracepoints[] = {"block_rq_insert", "block_rq_issue",
+                               "block_rq_complete"};
+
+  for (size_t i = 0; i < sizeof(tracepoints) / sizeof(tracepoints[0]); ++i) {
+
+    link = bpf_program__attach_tracepoint(prog, "block", tracepoints[i]);
+    if (libbpf_get_error(link)) {
+      fprintf(stderr, "ERROR: Attaching BPF program to tracepoint %s failed\n",
+              tracepoints[i]);
+      return 1;
+    }
   }
 
   signal(SIGINT, sig_handler);
@@ -159,29 +147,15 @@ int main(int argc, char **argv) {
 
   /* main: poll */
   while (1) {
-    sleep(env.interval);
-    printf("\n");
-
-    if (env.timestamp) {
-      time(&t);
-      tm = localtime(&t);
-      strftime(ts, sizeof(ts), "%H:%M:%S", tm);
-      printf("%-8s\n", ts);
-    }
-
-    err = print_log2_hists(obj->maps.hists, partitions);
+    sleep(interval);
+    // TODO: fix map and pass to the function below
+    err = print_log2_hists(obj->maps.hist);
     if (err)
       break;
 
-    if (exiting || --env.times == 0)
+    if (exiting)
       break;
   }
 
-cleanup:
-  iolatency_bpf__destroy(obj);
-  partitions__free(partitions);
-  if (cgfd > 0)
-    close(cgfd);
-
-  return err != 0;
+  return 0;
 }
