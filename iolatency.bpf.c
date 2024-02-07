@@ -142,17 +142,17 @@ cleanup:
   return 0;
 }
 
-SEC("tp_btf/block_rq_insert")
-int block_rq_insert_btf(u64 *ctx) { return handle_block_rq_insert(ctx); }
+// SEC("tp_btf/block_rq_insert")
+// int block_rq_insert_btf(u64 *ctx) { return handle_block_rq_insert(ctx); }
 
-SEC("tp_btf/block_rq_issue")
-int block_rq_issue_btf(u64 *ctx) { return handle_block_rq_issue(ctx); }
+// SEC("tp_btf/block_rq_issue")
+// int block_rq_issue_btf(u64 *ctx) { return handle_block_rq_issue(ctx); }
 
-SEC("tp_btf/block_rq_complete")
-int BPF_PROG(block_rq_complete_btf, struct request *rq, int error,
-             unsigned int nr_bytes) {
-  return handle_block_rq_complete(rq, error, nr_bytes);
-}
+// SEC("tp_btf/block_rq_complete")
+// int BPF_PROG(block_rq_complete_btf, struct request *rq, int error,
+//              unsigned int nr_bytes) {
+//   return handle_block_rq_complete(rq, error, nr_bytes);
+// }
 
 SEC("raw_tp/block_rq_insert")
 int BPF_PROG(block_rq_insert) { return handle_block_rq_insert(ctx); }
