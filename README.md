@@ -3,7 +3,7 @@ Install the following dependencies:
 
 ```bash
 sudo apt update
-sudo apt-get install -y make git gcc \
+sudo apt-get install -y make gcc \
     clang \
     llvm \
     libelf-dev \
